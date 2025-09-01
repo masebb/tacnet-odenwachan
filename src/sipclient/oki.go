@@ -47,7 +47,7 @@ func NewFromEnv() (*OkiSIP, error) {
 	}
 	listen := os.Getenv("OKI_SIP_LISTEN")
 	if listen == "" {
-		listen = "0.0.0.0:5060"
+		listen = ":0"
 	}
 	transport := strings.ToLower(os.Getenv("OKI_SIP_TRANSPORT"))
 	if transport == "" {
