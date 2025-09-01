@@ -1,0 +1,25 @@
+# VCS and IDE
+.git
+.github
+.gitignore
+.vscode
+.idea
+
+# Builds and caches
+build
+bin
+out
+/dist
+/node_modules
+/tmp
+/cache
+
+# Local env
+.env
+.env.*
+!.env.example
+example.env
+
+# Docker
+Dockerfile
+**/.DS_Store
