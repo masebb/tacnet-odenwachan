@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -106,21 +107,12 @@ type RegistryResponse struct {
 func (c *Client) GetPeersStatuses() (PeersStatusesResponse, error) {
 	var out PeersStatusesResponse
 	url := c.baseURL + "/pbxcore/api/sip/getPeersStatuses"
-	req, _ := http.NewRequest("GET", url, nil)
-	if c.debug {
-		log.Printf("[MikoPBX][REQ] GET %s", req.URL.String())
-	}
-	resp, err := c.http.Do(req)
+	status, b, err := c.getWithRetry(url)
 	if err != nil {
 		return out, err
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	if c.debug {
-		log.Printf("[MikoPBX][RES] %s %s Body: %s", resp.Status, req.URL.String(), previewJSON(b, 2000))
-	}
-	if resp.StatusCode != http.StatusOK {
-		return out, fmt.Errorf("getPeersStatuses %s: %s", resp.Status, string(b))
+	if status != http.StatusOK {
+		return out, fmt.Errorf("getPeersStatuses %d: %s", status, string(b))
 	}
 	if err := json.Unmarshal(b, &out); err != nil {
 		return out, err
@@ -131,21 +123,12 @@ func (c *Client) GetPeersStatuses() (PeersStatusesResponse, error) {
 func (c *Client) GetRegistry() (RegistryResponse, error) {
 	var out RegistryResponse
 	url := c.baseURL + "/pbxcore/api/sip/getRegistry"
-	req, _ := http.NewRequest("GET", url, nil)
-	if c.debug {
-		log.Printf("[MikoPBX][REQ] GET %s", req.URL.String())
-	}
-	resp, err := c.http.Do(req)
+	status, b, err := c.getWithRetry(url)
 	if err != nil {
 		return out, err
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	if c.debug {
-		log.Printf("[MikoPBX][RES] %s %s Body: %s", resp.Status, req.URL.String(), previewJSON(b, 2000))
-	}
-	if resp.StatusCode != http.StatusOK {
-		return out, fmt.Errorf("getRegistry %s: %s", resp.Status, string(b))
+	if status != http.StatusOK {
+		return out, fmt.Errorf("getRegistry %d: %s", status, string(b))
 	}
 	if err := json.Unmarshal(b, &out); err != nil {
 		return out, err
@@ -159,14 +142,9 @@ func (c *Client) GetPeerName(id string) (string, error) {
 		return "", nil
 	}
 	payload := map[string]string{"peer": id}
-	resp, err := c.PostJSON("/pbxcore/api/sip/getSipPeer", payload)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("getSipPeer %s: %s", resp.Status, string(b))
+	status, b := c.postJSONWithRetry("/pbxcore/api/sip/getSipPeer", payload)
+	if status != http.StatusOK {
+		return "", fmt.Errorf("getSipPeer %d: %s", status, string(b))
 	}
 	var out SipPeerResponse
 	if err := json.Unmarshal(b, &out); err != nil {
@@ -178,27 +156,118 @@ func (c *Client) GetPeerName(id string) (string, error) {
 	return out.Data.EndpointName, nil
 }
 
-// Optional helper for getSipPeer if needed later.
+// Optional helper retained for compatibility: returns a synthetic http.Response using unlimited retry logic.
 func (c *Client) PostJSON(path string, payload any) (*http.Response, error) {
-	b, _ := json.Marshal(payload)
-	req, err := http.NewRequest("POST", c.baseURL+path, bytes.NewReader(b))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.debug {
-		log.Printf("[MikoPBX][REQ] POST %s Headers: {Content-Type: %s} Body: %s", req.URL.String(), req.Header.Get("Content-Type"), previewJSON(b, 2000))
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if c.debug {
-		rb, _ := io.ReadAll(resp.Body)
-		log.Printf("[MikoPBX][RES] %s %s Body: %s", resp.Status, req.URL.String(), previewJSON(rb, 2000))
-		resp.Body = io.NopCloser(bytes.NewReader(rb))
+	status, body := c.postJSONWithRetry(path, payload)
+	resp := &http.Response{
+		StatusCode: status,
+		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Header:     make(http.Header),
+		Body:       io.NopCloser(bytes.NewReader(body)),
 	}
 	return resp, nil
+}
+
+// --- Internal retry helpers ---
+func (c *Client) getWithRetry(u string) (int, []byte, error) {
+	backoff := time.Second
+	attempt := 1
+	for {
+		req, _ := http.NewRequest("GET", u, nil)
+		if c.debug {
+			log.Printf("[MikoPBX][REQ] GET %s (attempt=%d)", req.URL.String(), attempt)
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			if c.debug {
+				log.Printf("[MikoPBX][ERR] GET %s error: %v (retry in %s)", u, err, backoff)
+			}
+			time.Sleep(backoff + jitter())
+			backoff = nextBackoff(backoff)
+			attempt++
+			continue
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if c.debug {
+			log.Printf("[MikoPBX][RES] %s %s Body: %s", resp.Status, u, previewJSON(b, 2000))
+		}
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			_ = c.Authenticate()
+			time.Sleep(200*time.Millisecond + jitter()/2)
+			attempt++
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			if c.debug {
+				log.Printf("[MikoPBX][RETRY] %s returned %d, retry in %s", u, resp.StatusCode, backoff)
+			}
+			time.Sleep(backoff + jitter())
+			backoff = nextBackoff(backoff)
+			attempt++
+			continue
+		}
+		return resp.StatusCode, b, nil
+	}
+}
+
+func (c *Client) postJSONWithRetry(path string, payload any) (int, []byte) {
+	body, _ := json.Marshal(payload)
+	url := c.baseURL + path
+	backoff := time.Second
+	attempt := 1
+	for {
+		req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		if c.debug {
+			log.Printf("[MikoPBX][REQ] POST %s Headers: {Content-Type: %s} Body: %s (attempt=%d)", url, req.Header.Get("Content-Type"), previewJSON(body, 2000), attempt)
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			if c.debug {
+				log.Printf("[MikoPBX][ERR] POST %s error: %v (retry in %s)", url, err, backoff)
+			}
+			time.Sleep(backoff + jitter())
+			backoff = nextBackoff(backoff)
+			attempt++
+			continue
+		}
+		rb, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if c.debug {
+			log.Printf("[MikoPBX][RES] %s %s Body: %s", resp.Status, url, previewJSON(rb, 2000))
+		}
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			_ = c.Authenticate()
+			time.Sleep(200*time.Millisecond + jitter()/2)
+			attempt++
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			if c.debug {
+				log.Printf("[MikoPBX][RETRY] %s returned %d, retry in %s", url, resp.StatusCode, backoff)
+			}
+			time.Sleep(backoff + jitter())
+			backoff = nextBackoff(backoff)
+			attempt++
+			continue
+		}
+		return resp.StatusCode, rb
+	}
+}
+
+func nextBackoff(cur time.Duration) time.Duration {
+	max := 60 * time.Second
+	n := cur * 2
+	if n > max {
+		n = max
+	}
+	return n
+}
+
+func jitter() time.Duration {
+	// 0-400ms jitter
+	return time.Duration(rand.Intn(401)) * time.Millisecond
 }
 
 // Helpers

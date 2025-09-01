@@ -113,7 +113,8 @@ func main() {
 		cli.SetDebug(true)
 	}
 	if err := cli.Authenticate(); err != nil {
-		log.Fatal(err)
+		// PBXが落ちている/未起動でもプロセスは落とさない
+		log.Printf("[WARN] MikoPBX authenticate failed (will retry on demand): %v", err)
 	}
 
 	// Interval (env)
